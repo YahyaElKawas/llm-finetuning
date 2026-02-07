@@ -1,1 +1,96 @@
+from google.colab import drive
+drive.mount('/gdrive')
+!pip install -qU transformers==4.48.3 datasets==3.2.0 optimum==1.24.0
+!pip install -qU openai==1.61.0 wandb
+from google.colab import userdata
+import wandb
+wandb.login(key=userdata.get('wandb'))
+hf_token = userdata.get('hf1')
+!hf auth login --token {hf_token}
+import json
+import os
+from os.path import join
+import random
+from tqdm.auto import tqdm
+import requests
 
+from pydantic import BaseModel, Field
+from typing import List, Optional, Literal
+from datetime import datetime
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import torch
+
+data_dir = "/gdrive/SharedWithMe/datasets/llamafactory-finetune-data"
+base_model_id = "Qwen/Qwen2.5-1.5B-Instruct"
+
+device = "cpu"
+
+story = """ ذكرت مجلة فوربس أن العائلة تلعب دورا محوريا في تشكيل علاقة الأفراد بالمال، حيث تتأثر هذه العلاقة بأنماط السلوك المالي المتوارثة عبر الأجيال.
+
+التقرير الذي يستند إلى أبحاث الأستاذ الجامعي شاين إنيت حول الرفاه المالي يوضح أن لكل شخص "شخصية مالية" تتحدد وفقا لطريقة تفاعله مع المال، والتي تتأثر بشكل مباشر بتربية الأسرة وتجارب الطفولة.
+
+الأبعاد الثلاثة للعلاقة بالمال بحسب الدراسة، هناك ثلاثة أبعاد رئيسية تشكّل علاقتنا بالمال:
+
+الاكتساب (A): يميل الأفراد الذين ينتمون لهذا البعد إلى اعتبار المال سلعة قابلة للجمع، حيث يرون في تحقيق الثروة هدفا بحد ذاته. والجانب السلبي لهذا النمط هو إمكانية التحول إلى هوس بالثروة أو العكس، أي رفض تام لاكتساب المال باعتباره مصدرا للفساد.
+
+الاستخدام (U): يرى هؤلاء الأشخاص المال أداة للتمتع بالحياة، حيث يربطون قيمته بقدرته على توفير المتعة والراحة. ومع ذلك، قد يصبح البعض مدمنا على الإنفاق، في حين يتجه آخرون إلى التقشف المفرط خوفا من المستقبل.
+
+الإدارة (M): أصحاب هذا النمط يعتبرون المال مسؤولية تتطلب التخطيط الدقيق. لكن في بعض الحالات، قد يتحول الأمر إلى هوس مفرط بإدارة الإنفاق، مما يؤثر سلبا على العلاقات الشخصية.
+
+كيف تؤثر العائلة على علاقتنا بالمال؟ يشير التقرير إلى أن التجارب الأسرية تلعب دورا رئيسيا في تحديد "الشخصية المالية" لكل فرد، على سبيل المثال، إذا كان أحد الوالدين يعتمد على المال كمكافأة للسلوك الجيد، فقد يتبنى الطفل لاحقا النمط نفسه في حياته البالغة.
+
+لتحليل هذه التأثيرات بشكل دقيق، طورت رابطة العلاج المالي (Financial Therapy Association) أداة تسمى مخطط الجينوم المالي (Money Genogram)، وهو نموذج يُستخدم لتحديد الأنماط المالية داخل العائلة.
+
+تتضمن هذه الأداة:
+
+رسم شجرة عائلية. تصنيف أفراد العائلة وفقا للأبعاد الثلاثة للعلاقة بالمال (A ،U ،M). تحديد ما إذا كان السلوك المالي لكل فرد صحيا (+) أو غير صحي (-). على سبيل المثال، إذا نشأ شخص في عائلة اعتادت على الإنفاق المفرط، فقد يكون لديه ميل قوي إلى اتباع النمط نفسه، أو العكس تماما، حيث يصبح مقتصدا بشكل مبالغ فيه كرد فعل نفسي. """
+
+
+StoryCategory = Literal["politics", "sports", "art", "technology", "economy",
+    "health", "entertainment", "science",
+    "not_specified"]
+
+EntityType = Literal["person-male", "person-female", "location", "organization", "event", "time",
+    "quantity", "money", "product", "law", "disease", "artifact", "not_specified"]
+
+class Entity(BaseModel):
+  entity_value: str = Field(..., description="The actual name or value of the entity.")
+  entity_type: EntityType = Field(..., description="The type of recognized entity.")
+
+class NewsDetails(BaseModel):
+  story_title: str = Field(..., min_length=5, max_length=300, description: "A fully informative and SEO optimized title of the story.")
+  story_keywords: List[str] = Field(..., min_items=1,description="Relevant keywords associated with the story.")
+  story_summary: List[str] = Field(..., min_items=1, max_items=5, description:"Summarized key points about the story (1-5 points).")
+  story_category: StoryCategory = Field(..., description="Category of the news story.")
+  story_entities: List[Entity] = Field(..., min_items = 1, max_items = 10, description="List of identified entities in the story.")
+
+
+DetailsExtractionMessages=[
+    {
+        "role": "System",
+        "content":"\n".join([
+            "You are an NLP data parser",
+            "You will be provided by an Arabic text.",
+            "You have to translate the text into the `Targeted Language`.",
+            "Follow the provided Scheme to generate a JSON",
+            "Do not generate any introduction or conclusion."
+        ])
+     },
+    {
+        "role":"user",
+        "content":"\n".join([
+            "## Story:"
+            story.strip(),
+            "",
+            "## Pydantic Details:",
+            json.dumps( TranslatedStory.model_json_schema(), ensure_ascii=False ),
+            "",
+            "## Targeted Language:",
+            targeted_lang,
+            "",
+            "## Translated Story:",
+            "```json"
+        ])
+    }
+]
